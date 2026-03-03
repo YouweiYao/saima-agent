@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+MAX_RETRIES = 3
+"""赛马智能体 - 后台执行版本（修复版）"""
+
+import json, openpyxl, requests, jieba, re, math
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import os
+from datetime import datetime
+
+QWEN_API_KEY = "sk-3d96ade0c8fa40378a4560fdd43b067e"
+QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+EXCEL_PATH = "/home/yaoyouwei/.openclaw/media/inbound/千帆融合版3.1功能清单---9a90c454-ccbf-48e1-957c-0878d2943a52.xlsx"
+REQ_PATH = "/home/openclaw/niuniu/saima/output/需求拆分_result.json"
+OUT_PATH = "/home/openclaw/niuniu/saima/output/final_output.json"
+OUT_EXCEL_PATH = "/home/openclaw/niuniu/saima/output/赛马匹配结果.xlsx"
+TOP_K = 10
+THRESHOLD = float(sys.argv[2]) if len(sys.argv) > 2 else 0.8
+MAX_WORKERS = int(sys.argv[1]) if len(sys.argv) > 1 else 15
+STATUS_FILE = "/tmp/saima_status.json"
+
+SHEETS = {"千帆appbuilder功能清单": "千帆AB", "千帆modelbuilder功能清单": "千帆MB"}
+
+# 需要过滤的需求类型
+EXCLUDE_CATEGORIES = ["商务需求", "运维/维保需求", "验收需求"]
+
+start_time = None
+
+def update_status(stage_name=None, progress=None, total=None, llm_calls=None, avg_time=None):
+    global start_time
+    if start_time is None:
+        return
+    
+    elapsed = time.time() - start_time
+    
+    status = {
+        "status": "running",
+        "stage": stage_name or "初始化",
+        "elapsed": f"{elapsed:.1f}秒"
+    }
+    
+    if progress:
+        status["progress"] = progress
+    if total:
+        status["total"] = total
+    if llm_calls is not None:
+        status["llm_calls"] = llm_calls
+    if avg_time:
+        status["avg_time"] = avg_time
+    
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, ensure_ascii=False, indent=2)
+
+def tokenize(text):
+    return [w for w in jieba.cut(re.sub(r'[^\w\u4e00-\u9fff]', ' ', text)) if len(w) >= 2]
+
+def get_caps(ws):
+    caps = []
+    # 继承值：用于处理空值（继承上一行的值）
+    last_values = {"module": "", "level1": "", "level2": "", "level3": "", "level4": ""}
+    
+    for row in range(2, ws.max_row + 1):
+        # 读取各列值
+        module = ws.cell(row, 2).value  # B列：模块名称
+        level1 = ws.cell(row, 3).value  # C列：一级功能
+        level2 = ws.cell(row, 4).value  # D列：二级功能
+        level3 = ws.cell(row, 5).value  # E列：三级功能
+        level4 = ws.cell(row, 6).value  # F列：四级功能
+        desc = ws.cell(row, 7).value or ""  # G列：功能描述
+        
+        # 更新继承值（只在非空时更新）
+        if module and str(module).strip() and str(module) != "-":
+            last_values["module"] = str(module).strip()
+        if level1 and str(level1).strip() and str(level1) != "-":
+            last_values["level1"] = str(level1).strip()
+        if level2 and str(level2).strip() and str(level2) != "-":
+            last_values["level2"] = str(level2).strip()
+        if level3 and str(level3).strip() and str(level3) != "-":
+            last_values["level3"] = str(level3).strip()
+        if level4 and str(level4).strip() and str(level4) != "-":
+            last_values["level4"] = str(level4).strip()
+        
+        # 构建层级路径（跳过空值和"-"）
+        path_parts = []
+        if last_values["module"]:
+            path_parts.append(last_values["module"])
+        if last_values["level1"]:
+            path_parts.append(last_values["level1"])
+        if last_values["level2"]:
+            path_parts.append(last_values["level2"])
+        if last_values["level3"]:
+            path_parts.append(last_values["level3"])
+        if last_values["level4"]:
+            path_parts.append(last_values["level4"])
+        
+        path_str = " > ".join(path_parts)
+        
+        if path_str and desc:
+            caps.append({"path": path_str, "desc": desc})
+    
+    return caps
+
+def recall(text, caps):
+    tokens = tokenize(text)
+    scores = []
+    for cap in caps:
+        s = sum(1 for t in tokens if t in cap['path'].lower() or t in cap['desc'].lower())
+        scores.append(s)
+    indexed = list(enumerate(scores))
+    indexed.sort(key=lambda x: -x[1])
+    return [caps[i] for i, _ in indexed[:TOP_K]]
+
+llm_stats = {"total": 0, "total_time": 0.0, "stages": {}}
+
+def call_llm_with_stats(prompt):
+    global llm_stats
+    t0 = time.time()
+    try:
+        resp = requests.post(f"{QWEN_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "qwen-plus", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}, timeout=60)
+        elapsed = time.time() - t0
+        llm_stats["total"] += 1
+        llm_stats["total_time"] += elapsed
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+    except: pass
+    return None
+
+def build_match_prompt(req, features):
+    features_str = "\n\n".join(f"【候选功能 {i+1}】\n{f['path']}\n{f['desc']}" for i, f in enumerate(features))
+    system_prompt = """你是一名专业的软件产品功能匹配分析助手。"""
+    user_prompt = f"""请根据以下输入信息，完成一次【需求与产品功能匹配判断】
+
+【一、输入数据】
+- source_text：整体需求背景
+- requirement：当前评估的用户需求
+- category：需求类型
+- features：候选产品功能全集
+
+--------------------------------
+【source_text】
+{req.get('source_text', '')}
+
+【requirement】
+{req['requirement']}
+
+【category】
+{req['category']}
+
+【features（候选功能全集）】
+{features_str}
+
+【二、匹配规则】
+
+1. 聚合匹配原则
+- 一个requirement允许被多个候选功能点共同覆盖
+
+2. founction_match_level 定义
+- 表示：候选功能集合对需求语义要点的整体覆盖程度
+- 取值范围：[0.00, 1.00]
+- 类型：字符串
+
+3. is_product_function_matched 判定规则
+- founction_match_level ≥ {THRESHOLD} → 是
+- 否则 → 否
+
+--------------------------------
+【三、输出格式（严格JSON）】
+
+{{
+  "requirement_id": "REQ-001",
+  "requirement": "需求原文",
+  "category": "类别",
+  "matched_functions": [
+    {{
+      "product_name": "千帆AB/千帆MB",
+      "product_function_level": "层级路径",
+      "product_detail_source_text": "功能原文",
+      "founction_match_level": "0.00-1.00",
+      "is_product_function_matched": "是或否"
+    }}
+  ]
+}}
+
+⚠️ 必须一次性输出完整JSON"""
+    return system_prompt, user_prompt
+
+def build_risk_prompt(req, matched_result):
+    is_matched = matched_result.get('is_product_function_matched', '否')
+    system_prompt = """你是一名具有丰富软件交付与实施经验的技术方案专家。"""
+    user_prompt = f"""【requirement】\n{req['requirement']}\n【category】\n{req['category']}\n【is_product_function_matched】\n{is_matched}\n【输出JSON】\n{{"matched_functions": [{{"delivery_type": "类型", "reqirement_quality_level": "0-1", "customized_work_details": "工作内容", "is_open_requirement": "是或否", "risk_management_strategy": "风险策略", "requirement_clarity_score": "0-1", "clarity_risk_type": "风险类型"}}]}}"""
+    return system_prompt, user_prompt
+
+def main():
+    global start_time, llm_stats
+    start_time = time.time()
+    llm_stats = {"total": 0, "total_time": 0.0, "stages": {"match": 0, "risk": 0}}
+    
+    update_status()
+    
+    # 读取需求
+    # 读取需求
+    with open(REQ_PATH, "r") as f:
+        raw_data = json.load(f)
+
+    # 适配新格式: {"results": [{"source_text": "...", "requirement": "...", "category": "..."}]}
+    data = raw_data.get("results", [])
+    total_reqs = len(data)
+    
+    # 读取产品
+    wb = openpyxl.load_workbook(EXCEL_PATH)
+    products = []
+    for sheet_name in SHEETS:
+        if sheet_name in wb.sheetnames:
+            caps = get_caps(wb[sheet_name])
+            products.append({"name": sheet_name, "short": SHEETS[sheet_name], "caps": caps})
+    
+    # 准备任务 - 修复1: 从req中获取source_text
+    # 修复2: 过滤掉不需要的需求类型
+    match_tasks = []
+    req_list = []
+    filtered_count = 0
+    
+    # 适配新格式: 直接遍历 data
+    for item in data:
+            # 修复2: 过滤掉不需要的需求类型
+            category = item.get('category', '')
+            if category in EXCLUDE_CATEGORIES:
+                filtered_count += 1
+                continue
+            
+            # 修复1: 从req中获取source_text
+            source = item.get('source_text', '')
+            req_text = item.get('requirement', '')
+            req_list.append({"text": req_text, "category": category, "source": source})
+            for p in products:
+                match_tasks.append((req_text, category, source, p))
+    
+    # print(f"[INFO] 原始需求数: {total_reqs}")
+    # print(f"[INFO] 过滤掉的需求数: {filtered_count}")
+    # print(f"[INFO] 待匹配需求数: {len(req_list)}")
+    
+    # 更新状态 - 开始功能匹配
+    update_status(
+        stage_name="2_功能匹配",
+        total=len(match_tasks)
+    )
+    
+    # 并发匹配
+    match_results = [None] * len(match_tasks)
+    completed = 0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
+        for i, (req_text, category, source, p) in enumerate(match_tasks):
+            caps = recall(req_text, p['caps'])
+            sp, up = build_match_prompt({"requirement": req_text, "category": category, "source_text": source}, caps)
+            future = executor.submit(call_llm_with_stats, sp + "\n\n" + up)
+            futures[future] = (i, req_text, category, source, p, caps)
+        
+        for future in as_completed(futures):
+            i, req_text, category, source, p, caps = futures[future]
+            resp = future.result()
+            llm_stats["stages"]["match"] += 1
+            
+            if resp:
+                try:
+                    result = json.loads(resp[resp.find('{'):resp.rfind('}')+1])
+                    mfs = result.get('matched_functions', [])
+                    if mfs and isinstance(mfs, list):
+                        mf = mfs[0]
+                        mf['product_name'] = p['short']
+                        score_str = mf.get('founction_match_level', '0')
+                        try:
+                            score = float(score_str) if score_str else 0
+                        except:
+                            score = 0
+                        match_results[i] = {"mf": mf, "score": score, "caps": caps, "product": p['short']}
+                except:
+                    pass
+            
+            completed += 1
+            if completed % 10 == 0:
+                elapsed = time.time() - start_time
+                avg = llm_stats["total_time"] / max(1, llm_stats["total"])
+                update_status(
+                    stage_name="2_功能匹配",
+                    progress=f"{completed}/{len(match_tasks)}",
+                    total=len(match_tasks),
+                    llm_calls=llm_stats["total"],
+                    avg_time=f"{avg:.1f}秒/次"
+                )
+    
+    # 整理结果
+    results = []
+    for req_info in req_list:
+        best_match = None
+        best_score = -1
+        best_product = None
+        best_caps = None
+        
+        for j in range(len(products)):
+            idx = req_list.index(req_info) * len(products) + j
+            result = match_results[idx]
+            if result and result["score"] > best_score:
+                best_score = result["score"]
+                best_match = result["mf"]
+                best_product = result["product"]
+                best_caps = result["caps"]
+        
+        req_result = {"requirement": req_info["text"], "category": req_info["category"], "matched_functions": []}
+        
+        if best_match:
+            if best_score >= THRESHOLD:
+                best_match['is_product_function_matched'] = "是"
+                best_match['delivery_type'] = "标品功能"
+                func_level = best_match.get('product_function_level', '')
+                if best_caps and func_level:
+                    for cap in best_caps:
+                        if func_level in cap.get('path', ''):
+                            # 只替换功能原文，保持层级路径不变
+                            best_match['product_detail_source_text'] = cap.get('desc', '')
+                            break
+                req_result['matched_functions'].append(best_match)
+            else:
+                empty_match = {"product_name": best_product, "product_function_level": "", "product_detail_source_text": "", "founction_match_level": "0", "is_product_function_matched": "否"}
+                req_result['matched_functions'].append(empty_match)
+        
+        req_result['source_text'] = req_info["source"]
+        results.append(req_result)
+    
+    # 风险评估
+    risk_tasks = []
+    risk_req_indices = []
+    for i, req_result in enumerate(results):
+        mf = req_result.get('matched_functions', [])
+        if mf and mf[0].get('is_product_function_matched') == "否":
+            risk_tasks.append((req_result['requirement'], req_result['category'], mf[0]))
+            risk_req_indices.append(i)
+    
+    if risk_tasks:
+        risk_completed = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {}
+            for i, (req_text, category, empty_match) in enumerate(risk_tasks):
+                rsp, rup = build_risk_prompt({"requirement": req_text, "category": category}, empty_match)
+                future = executor.submit(call_llm_with_stats, rsp + "\n\n" + rup)
+                futures[future] = (i, req_text, category, empty_match)
+            
+            for future in as_completed(futures):
+                i, req_text, category, empty_match = futures[future]
+                resp = future.result()
+                llm_stats["stages"]["risk"] += 1
+                risk_completed += 1
+                
+                # 更新状态 - 风险评估阶段
+                elapsed = time.time() - start_time
+                avg = llm_stats["total_time"] / max(1, llm_stats["total"])
+                update_status(
+                    stage_name="3_交付风险评估",
+                    progress=f"{risk_completed}/{len(risk_tasks)}",
+                    total=len(risk_tasks),
+                    llm_calls=llm_stats["total"],
+                    avg_time=f"{avg:.1f}秒/次"
+                )
+                
+                if resp:
+                    try:
+                        r = json.loads(resp[resp.find('{'):resp.rfind('}')+1])
+                        if r.get('matched_functions'):
+                            risk_tasks[i] = (req_text, category, r['matched_functions'][0])
+                    except:
+                        pass
+        
+        for i, req_idx in enumerate(risk_req_indices):
+            if len(risk_tasks[i]) == 3 and isinstance(risk_tasks[i][2], dict):
+                results[req_idx]['matched_functions'][0].update(risk_tasks[i][2])
+    
+    # 保存结果
+    with open(OUT_PATH, 'w') as f:
+        json.dump({"results": results}, f, ensure_ascii=False, indent=2)
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "匹配结果"
+    
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    
+    headers = ["来源原文", "需求描述", "需求分类", "产品名称", "产品功能层级", "功能原文", "功能匹配度", "是否匹配", "交付方式", "需求质量度", "定制化工作说明", "是否开放需求", "风险应对策略"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(1, col, h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = thin_border
+        cell.alignment = Alignment(wrap_text=True, vertical='center')
+    
+    row = 2
+    for req_result in results:
+        source_text = req_result.get('source_text', '')
+        requirement = req_result.get('requirement', '')
+        category = req_result.get('category', '')
+        
+        for mf in req_result.get('matched_functions', []):
+            ws.cell(row, 1, source_text).border = thin_border
+            ws.cell(row, 2, requirement).border = thin_border
+            ws.cell(row, 3, category).border = thin_border
+            ws.cell(row, 4, mf.get('product_name', '')).border = thin_border
+            ws.cell(row, 5, mf.get('product_function_level', '')).border = thin_border
+            ws.cell(row, 6, mf.get('product_detail_source_text', '')).border = thin_border
+            ws.cell(row, 7, mf.get('founction_match_level', '')).border = thin_border
+            ws.cell(row, 8, mf.get('is_product_function_matched', '')).border = thin_border
+            ws.cell(row, 9, mf.get('delivery_type', '')).border = thin_border
+            ws.cell(row, 10, mf.get('reqirement_quality_level', '')).border = thin_border
+            ws.cell(row, 11, mf.get('customized_work_details', '')).border = thin_border
+            ws.cell(row, 12, mf.get('is_open_requirement', '')).border = thin_border
+            ws.cell(row, 13, mf.get('risk_management_strategy', '')).border = thin_border
+            row += 1
+    
+    # 设置列宽
+    for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M']:
+        ws.column_dimensions[col].width = 30 if col == 'A' else 15
+    
+    # 合并单元格逻辑（从左到右依次判断）
+    # 只有当"前面所有列的值都相同"时才合并当前列
+    def merge_cells_left_to_right(ws, start_row, max_row, max_col):
+        """从左到右依次判断：只有前面所有列都相同才合并"""
+        for col_idx in range(1, max_col + 1):
+            col_letter = chr(64 + col_idx)
+            merge_start = start_row
+            
+            for row in range(start_row + 1, max_row + 1):
+                # 检查当前行的当前列是否与上一行相同
+                current_same = True
+                for check_col in range(1, col_idx + 1):
+                    curr_val = ws.cell(row, check_col).value
+                    prev_val = ws.cell(row - 1, check_col).value
+                    if curr_val != prev_val:
+                        current_same = False
+                        break
+                
+                if current_same:
+                    # 前面所有列都相同，继续（不合并）
+                    continue
+                else:
+                    # 当前列值不同，检查前面是否有需要合并的
+                    if row - 1 > merge_start:
+                        ws.merge_cells(f'{col_letter}{merge_start}:{col_letter}{row - 1}')
+                    merge_start = row
+            
+            # 最后一段
+            if max_row > merge_start:
+                ws.merge_cells(f'{col_letter}{merge_start}:{col_letter}{max_row}')
+    
+    # 应用合并单元格（A到M列，从第2行开始，共13列）
+    merge_cells_left_to_right(ws, 2, row - 1, 13)
+    
+    wb.save(OUT_EXCEL_PATH)
+    
+    elapsed = time.time() - start_time
+    avg = llm_stats["total_time"] / max(1, llm_stats["total"])
+    
+    status = {
+        "status": "completed",
+        "stage": "完成",
+        "total_llm_calls": llm_stats["total"],
+        "total_time": f"{elapsed:.1f}秒",
+        "avg_time": f"{avg:.1f}秒/次",
+        "output": OUT_EXCEL_PATH,
+        "filtered_count": filtered_count
+    }
+    with open(STATUS_FILE, 'w') as f:
+        json.dump(status, f, ensure_ascii=False, indent=2)
+
+if __name__ == "__main__":
+    main()
