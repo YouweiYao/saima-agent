@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import sys
 MAX_RETRIES = 3
 """赛马智能体 - 后台执行版本（修复版）"""
 
@@ -128,69 +129,22 @@ def call_llm_with_stats(prompt):
     except: pass
     return None
 
-def build_match_prompt(req, features):
-    features_str = "\n\n".join(f"【候选功能 {i+1}】\n{f['path']}\n{f['desc']}" for i, f in enumerate(features))
-    system_prompt = """你是一名专业的软件产品功能匹配分析助手。"""
-    user_prompt = f"""请根据以下输入信息，完成一次【需求与产品功能匹配判断】
-
-【一、输入数据】
-- source_text：整体需求背景
-- requirement：当前评估的用户需求
-- category：需求类型
-- features：候选产品功能全集
-
---------------------------------
-【source_text】
-{req.get('source_text', '')}
-
-【requirement】
-{req['requirement']}
-
-【category】
-{req['category']}
-
-【features（候选功能全集）】
-{features_str}
-
-【二、匹配规则】
-
-1. 聚合匹配原则
-- 一个requirement允许被多个候选功能点共同覆盖
-
-2. founction_match_level 定义
-- 表示：候选功能集合对需求语义要点的整体覆盖程度
-- 取值范围：[0.00, 1.00]
-- 类型：字符串
-
-3. is_product_function_matched 判定规则
-- founction_match_level ≥ {THRESHOLD} → 是
-- 否则 → 否
-
---------------------------------
-【三、输出格式（严格JSON）】
-
-{{
-  "requirement_id": "REQ-001",
-  "requirement": "需求原文",
-  "category": "类别",
-  "matched_functions": [
-    {{
-      "product_name": "千帆AB/千帆MB",
-      "product_function_level": "层级路径",
-      "product_detail_source_text": "功能原文",
-      "founction_match_level": "0.00-1.00",
-      "is_product_function_matched": "是或否"
-    }}
-  ]
-}}
-
-⚠️ 必须一次性输出完整JSON"""
+def build_match_prompt(req, features, threshold=0.8, requirement_id="REQ-001"):
+    """使用模板构建功能匹配prompt"""
+    system_prompt = MATCH_SYSTEM_PROMPT
+    user_prompt = build_match_user_prompt(req, features, threshold=threshold, requirement_id=requirement_id)
     return system_prompt, user_prompt
 
+# 从模板读取风险评估prompt
+import sys
+sys.path.insert(0, '/home/openclaw/niuniu/code/2-赛马智能体/prompts')
+from risk_prompt import RISK_SYSTEM_PROMPT, build_risk_user_prompt
+from match_prompt import MATCH_SYSTEM_PROMPT, build_match_user_prompt
+
 def build_risk_prompt(req, matched_result):
-    is_matched = matched_result.get('is_product_function_matched', '否')
-    system_prompt = """你是一名具有丰富软件交付与实施经验的技术方案专家。"""
-    user_prompt = f"""【requirement】\n{req['requirement']}\n【category】\n{req['category']}\n【is_product_function_matched】\n{is_matched}\n【输出JSON】\n{{"matched_functions": [{{"delivery_type": "类型", "reqirement_quality_level": "0-1", "customized_work_details": "工作内容", "is_open_requirement": "是或否", "risk_management_strategy": "风险策略", "requirement_clarity_score": "0-1", "clarity_risk_type": "风险类型"}}]}}"""
+    """使用模板构建风险评估prompt"""
+    system_prompt = RISK_SYSTEM_PROMPT
+    user_prompt = build_risk_user_prompt(req, matched_result)
     return system_prompt, user_prompt
 
 def main():
@@ -223,20 +177,22 @@ def main():
     req_list = []
     filtered_count = 0
     
-    # 适配新格式: 直接遍历 data
+    # 适配正确格式: {"results": [{"source_text": "...", "requirements": [{"requirement": "...", "category": "..."}]}]}
     for item in data:
-            # 修复2: 过滤掉不需要的需求类型
-            category = item.get('category', '')
+        source = item.get('source_text', '')
+        for req in item.get('requirements', []):
+            req_text = req.get('requirement', '')
+            category = req.get('category', '')
+            
+            # 过滤掉不需要的需求类型
             if category in EXCLUDE_CATEGORIES:
                 filtered_count += 1
                 continue
             
-            # 修复1: 从req中获取source_text
-            source = item.get('source_text', '')
-            req_text = item.get('requirement', '')
-            req_list.append({"text": req_text, "category": category, "source": source})
+            req_list.append({"text": req_text, "category": category, "source": source, "requirement_id": req.get('requirement_id', '')})
             for p in products:
-                match_tasks.append((req_text, category, source, p))
+                req_id = req.get('requirement_id', '')
+                match_tasks.append((req_id, req_text, category, source, p))
     
     # print(f"[INFO] 原始需求数: {total_reqs}")
     # print(f"[INFO] 过滤掉的需求数: {filtered_count}")
@@ -254,14 +210,14 @@ def main():
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {}
-        for i, (req_text, category, source, p) in enumerate(match_tasks):
+        for i, (req_id, req_text, category, source, p) in enumerate(match_tasks):
             caps = recall(req_text, p['caps'])
-            sp, up = build_match_prompt({"requirement": req_text, "category": category, "source_text": source}, caps)
+            sp, up = build_match_prompt({"requirement": req_text, "category": category, "source_text": source}, caps, requirement_id=req_id if req_id else f"REQ-{i+1:03d}")
             future = executor.submit(call_llm_with_stats, sp + "\n\n" + up)
-            futures[future] = (i, req_text, category, source, p, caps)
+            futures[future] = (i, req_id, req_text, category, source, p, caps)
         
         for future in as_completed(futures):
-            i, req_text, category, source, p, caps = futures[future]
+            i, req_id, req_text, category, source, p, caps = futures[future]
             resp = future.result()
             llm_stats["stages"]["match"] += 1
             
@@ -294,8 +250,13 @@ def main():
                 )
     
     # 整理结果
-    results = []
+    # 构建嵌套结构: {"source_text": "...", "requirements": [{"requirement": "...", "category": "...", "matched_functions": [...]}]}
+    source_map = {}
     for req_info in req_list:
+        source = req_info["source"]
+        if source not in source_map:
+            source_map[source] = {"source_text": source, "requirements": []}
+        
         best_match = None
         best_score = -1
         best_product = None
@@ -310,47 +271,52 @@ def main():
                 best_product = result["product"]
                 best_caps = result["caps"]
         
-        req_result = {"requirement": req_info["text"], "category": req_info["category"], "matched_functions": []}
+        req_result = {'requirement_id': req_info.get('requirement_id', ''), 'requirement': req_info['text'], 'category': req_info['category'], 'matched_functions': []}
         
         if best_match:
             if best_score >= THRESHOLD:
-                best_match['is_product_function_matched'] = "是"
-                best_match['delivery_type'] = "标品功能"
+                best_match['is_product_function_matched'] = '是'
+                best_match['delivery_type'] = '标品功能'
                 func_level = best_match.get('product_function_level', '')
                 if best_caps and func_level:
                     for cap in best_caps:
                         if func_level in cap.get('path', ''):
-                            # 只替换功能原文，保持层级路径不变
                             best_match['product_detail_source_text'] = cap.get('desc', '')
                             break
                 req_result['matched_functions'].append(best_match)
             else:
-                empty_match = {"product_name": best_product, "product_function_level": "", "product_detail_source_text": "", "founction_match_level": "0", "is_product_function_matched": "否"}
+                # best_match 存在但分数 < THRESHOLD，添加空匹配结果
+                empty_match = {'product_name': best_product, 'product_function_level': '', 'product_detail_source_text': '', 'founction_match_level': str(best_score), 'is_product_function_matched': '否'}
                 req_result['matched_functions'].append(empty_match)
+        else:
+            empty_match = {'product_name': best_product, 'product_function_level': '', 'product_detail_source_text': '', 'founction_match_level': '0', 'is_product_function_matched': '否'}
+            req_result['matched_functions'].append(empty_match)
         
-        req_result['source_text'] = req_info["source"]
-        results.append(req_result)
+        source_map[source]["requirements"].append(req_result)
     
-    # 风险评估
+    results = list(source_map.values())
+    
+    # 风险评估 - 适配嵌套结构
     risk_tasks = []
-    risk_req_indices = []
-    for i, req_result in enumerate(results):
-        mf = req_result.get('matched_functions', [])
-        if mf and mf[0].get('is_product_function_matched') == "否":
-            risk_tasks.append((req_result['requirement'], req_result['category'], mf[0]))
-            risk_req_indices.append(i)
+    risk_req_indices = []  # (source_index, req_index) 元组
+    for src_idx, source_result in enumerate(results):
+        for req_idx, req_result in enumerate(source_result.get('requirements', [])):
+            mf = req_result.get('matched_functions', [])
+            if mf and mf[0].get('is_product_function_matched') == "否":
+                risk_tasks.append((req_result.get('requirement_id', ''), req_result['requirement'], req_result['category'], mf[0]))
+                risk_req_indices.append((src_idx, req_idx))
     
     if risk_tasks:
         risk_completed = 0
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {}
-            for i, (req_text, category, empty_match) in enumerate(risk_tasks):
-                rsp, rup = build_risk_prompt({"requirement": req_text, "category": category}, empty_match)
+            for i, (req_id, req_text, category, empty_match) in enumerate(risk_tasks):
+                rsp, rup = build_risk_prompt({"requirement": req_text, "category": category, "requirement_id": req_id}, empty_match)
                 future = executor.submit(call_llm_with_stats, rsp + "\n\n" + rup)
-                futures[future] = (i, req_text, category, empty_match)
+                futures[future] = (i, req_id, req_text, category, empty_match)
             
             for future in as_completed(futures):
-                i, req_text, category, empty_match = futures[future]
+                i, req_id, req_text, category, empty_match = futures[future]
                 resp = future.result()
                 llm_stats["stages"]["risk"] += 1
                 risk_completed += 1
@@ -374,9 +340,9 @@ def main():
                     except:
                         pass
         
-        for i, req_idx in enumerate(risk_req_indices):
-            if len(risk_tasks[i]) == 3 and isinstance(risk_tasks[i][2], dict):
-                results[req_idx]['matched_functions'][0].update(risk_tasks[i][2])
+        for i, (src_idx, req_idx) in enumerate(risk_req_indices):
+            if len(risk_tasks[i]) == 4 and isinstance(risk_tasks[i][2], dict):
+                results[src_idx]['requirements'][req_idx]['matched_functions'][0].update(risk_tasks[i][2])
     
     # 保存结果
     with open(OUT_PATH, 'w') as f:
@@ -399,26 +365,43 @@ def main():
         cell.alignment = Alignment(wrap_text=True, vertical='center')
     
     row = 2
-    for req_result in results:
-        source_text = req_result.get('source_text', '')
-        requirement = req_result.get('requirement', '')
-        category = req_result.get('category', '')
-        
-        for mf in req_result.get('matched_functions', []):
-            ws.cell(row, 1, source_text).border = thin_border
-            ws.cell(row, 2, requirement).border = thin_border
-            ws.cell(row, 3, category).border = thin_border
-            ws.cell(row, 4, mf.get('product_name', '')).border = thin_border
-            ws.cell(row, 5, mf.get('product_function_level', '')).border = thin_border
-            ws.cell(row, 6, mf.get('product_detail_source_text', '')).border = thin_border
-            ws.cell(row, 7, mf.get('founction_match_level', '')).border = thin_border
-            ws.cell(row, 8, mf.get('is_product_function_matched', '')).border = thin_border
-            ws.cell(row, 9, mf.get('delivery_type', '')).border = thin_border
-            ws.cell(row, 10, mf.get('reqirement_quality_level', '')).border = thin_border
-            ws.cell(row, 11, mf.get('customized_work_details', '')).border = thin_border
-            ws.cell(row, 12, mf.get('is_open_requirement', '')).border = thin_border
-            ws.cell(row, 13, mf.get('risk_management_strategy', '')).border = thin_border
-            row += 1
+    for source_result in results:
+        source_text = source_result.get('source_text', '')
+        for req_result in source_result.get('requirements', []):
+            requirement = req_result.get('requirement', '')
+            category = req_result.get('category', '')
+            
+            for mf in req_result.get('matched_functions', []):
+                ws.cell(row, 1, source_text).border = thin_border
+                ws.cell(row, 2, requirement).border = thin_border
+                ws.cell(row, 3, category).border = thin_border
+                ws.cell(row, 4, mf.get('product_name', '')).border = thin_border
+                ws.cell(row, 5, mf.get('product_function_level', '')).border = thin_border
+                ws.cell(row, 6, mf.get('product_detail_source_text', '')).border = thin_border
+                ws.cell(row, 7, mf.get('founction_match_level', '')).border = thin_border
+                ws.cell(row, 8, mf.get('is_product_function_matched', '')).border = thin_border
+                ws.cell(row, 9, mf.get('delivery_type', '')).border = thin_border
+                ws.cell(row, 10, mf.get('reqirement_quality_level', '')).border = thin_border
+                # 格式化定制化工作说明（字典转字符串）
+                work_details = mf.get('customized_work_details', '')
+                if isinstance(work_details, dict):
+                    lines = []
+                    if 'Summary' in work_details:
+                        lines.append("【摘要】" + work_details['Summary'])
+                    if 'Work Breakdown' in work_details:
+                        lines.append("【工作拆分】")
+                        for i, work_item in enumerate(work_details['Work Breakdown'], 1):
+                            lines.append(str(i) + ". " + work_item)
+                    if 'Man-day Estimation' in work_details:
+                        md = work_details['Man-day Estimation']
+                        dev = md.get('development_person_days', 'N/A')
+                        test = md.get('testing_person_days', 'N/A')
+                        lines.append("【人天估算】开发" + dev + "人天，测试" + test + "人天")
+                    work_details = '\n'.join(lines)
+                ws.cell(row, 11, work_details).border = thin_border
+                ws.cell(row, 12, mf.get('is_open_requirement', '')).border = thin_border
+                ws.cell(row, 13, mf.get('risk_management_strategy', '')).border = thin_border
+                row += 1
     
     # 设置列宽
     for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M']:
