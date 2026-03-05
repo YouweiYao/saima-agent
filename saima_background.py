@@ -336,7 +336,7 @@ def main():
                     try:
                         r = json.loads(resp[resp.find('{'):resp.rfind('}')+1])
                         if r.get('matched_functions'):
-                            risk_tasks[i] = (req_text, category, r['matched_functions'][0])
+                            risk_tasks[i] = (req_id, req_text, category, r['matched_functions'][0])
                     except:
                         pass
         
