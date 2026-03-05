@@ -341,8 +341,8 @@ def main():
                         pass
         
         for i, (src_idx, req_idx) in enumerate(risk_req_indices):
-            if len(risk_tasks[i]) == 4 and isinstance(risk_tasks[i][2], dict):
-                results[src_idx]['requirements'][req_idx]['matched_functions'][0].update(risk_tasks[i][2])
+            if len(risk_tasks[i]) == 4 and isinstance(risk_tasks[i][3], dict):
+                results[src_idx]['requirements'][req_idx]['matched_functions'][0].update(risk_tasks[i][3])
     
     # 保存结果
     with open(OUT_PATH, 'w') as f:
