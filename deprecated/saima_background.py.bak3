@@ -129,10 +129,63 @@ def call_llm_with_stats(prompt):
     except: pass
     return None
 
-def build_match_prompt(req, features, threshold=0.8, requirement_id="REQ-001"):
-    """使用模板构建功能匹配prompt"""
-    system_prompt = MATCH_SYSTEM_PROMPT
-    user_prompt = build_match_user_prompt(req, features, threshold=threshold, requirement_id=requirement_id)
+def build_match_prompt(req, features):
+    features_str = "\n\n".join(f"【候选功能 {i+1}】\n{f['path']}\n{f['desc']}" for i, f in enumerate(features))
+    system_prompt = """你是一名专业的软件产品功能匹配分析助手。"""
+    user_prompt = f"""请根据以下输入信息，完成一次【需求与产品功能匹配判断】
+
+【一、输入数据】
+- source_text：整体需求背景
+- requirement：当前评估的用户需求
+- category：需求类型
+- features：候选产品功能全集
+
+--------------------------------
+【source_text】
+{req.get('source_text', '')}
+
+【requirement】
+{req['requirement']}
+
+【category】
+{req['category']}
+
+【features（候选功能全集）】
+{features_str}
+
+【二、匹配规则】
+
+1. 聚合匹配原则
+- 一个requirement允许被多个候选功能点共同覆盖
+
+2. founction_match_level 定义
+- 表示：候选功能集合对需求语义要点的整体覆盖程度
+- 取值范围：[0.00, 1.00]
+- 类型：字符串
+
+3. is_product_function_matched 判定规则
+- founction_match_level ≥ {THRESHOLD} → 是
+- 否则 → 否
+
+--------------------------------
+【三、输出格式（严格JSON）】
+
+{{
+  "requirement_id": "REQ-001",
+  "requirement": "需求原文",
+  "category": "类别",
+  "matched_functions": [
+    {{
+      "product_name": "千帆AB/千帆MB",
+      "product_function_level": "层级路径",
+      "product_detail_source_text": "功能原文",
+      "founction_match_level": "0.00-1.00",
+      "is_product_function_matched": "是或否"
+    }}
+  ]
+}}
+
+⚠️ 必须一次性输出完整JSON"""
     return system_prompt, user_prompt
 
 # 从模板读取风险评估prompt
@@ -141,10 +194,10 @@ sys.path.insert(0, '/home/openclaw/niuniu/code/2-赛马智能体/prompts')
 from risk_prompt import RISK_SYSTEM_PROMPT, build_risk_user_prompt
 from match_prompt import MATCH_SYSTEM_PROMPT, build_match_user_prompt
 
-def build_risk_prompt(req, matched_result, open_requirement_threshold=0.5):
+def build_risk_prompt(req, matched_result):
     """使用模板构建风险评估prompt"""
     system_prompt = RISK_SYSTEM_PROMPT
-    user_prompt = build_risk_user_prompt(req, matched_result, open_requirement_threshold=open_requirement_threshold)
+    user_prompt = build_risk_user_prompt(req, matched_result)
     return system_prompt, user_prompt
 
 def main():
@@ -189,10 +242,9 @@ def main():
                 filtered_count += 1
                 continue
             
-            req_list.append({"text": req_text, "category": category, "source": source, "requirement_id": req.get('requirement_id', '')})
+            req_list.append({"text": req_text, "category": category, "source": source})
             for p in products:
-                req_id = req.get('requirement_id', '')
-                match_tasks.append((req_id, req_text, category, source, p))
+                match_tasks.append((req_text, category, source, p))
     
     # print(f"[INFO] 原始需求数: {total_reqs}")
     # print(f"[INFO] 过滤掉的需求数: {filtered_count}")
@@ -210,14 +262,14 @@ def main():
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {}
-        for i, (req_id, req_text, category, source, p) in enumerate(match_tasks):
+        for i, (req_text, category, source, p) in enumerate(match_tasks):
             caps = recall(req_text, p['caps'])
-            sp, up = build_match_prompt({"requirement": req_text, "category": category, "source_text": source}, caps, requirement_id=req_id if req_id else f"REQ-{i+1:03d}")
+            sp, up = build_match_prompt({"requirement": req_text, "category": category, "source_text": source}, caps)
             future = executor.submit(call_llm_with_stats, sp + "\n\n" + up)
-            futures[future] = (i, req_id, req_text, category, source, p, caps)
+            futures[future] = (i, req_text, category, source, p, caps)
         
         for future in as_completed(futures):
-            i, req_id, req_text, category, source, p, caps = futures[future]
+            i, req_text, category, source, p, caps = futures[future]
             resp = future.result()
             llm_stats["stages"]["match"] += 1
             
@@ -271,7 +323,7 @@ def main():
                 best_product = result["product"]
                 best_caps = result["caps"]
         
-        req_result = {'requirement_id': req_info.get('requirement_id', ''), 'requirement': req_info['text'], 'category': req_info['category'], 'matched_functions': []}
+        req_result = {'requirement': req_info['text'], 'category': req_info['category'], 'matched_functions': []}
         
         if best_match:
             if best_score >= THRESHOLD:
@@ -303,20 +355,20 @@ def main():
         for req_idx, req_result in enumerate(source_result.get('requirements', [])):
             mf = req_result.get('matched_functions', [])
             if mf and mf[0].get('is_product_function_matched') == "否":
-                risk_tasks.append((req_result.get('requirement_id', ''), req_result['requirement'], req_result['category'], mf[0]))
+                risk_tasks.append((req_result['requirement'], req_result['category'], mf[0]))
                 risk_req_indices.append((src_idx, req_idx))
     
     if risk_tasks:
         risk_completed = 0
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {}
-            for i, (req_id, req_text, category, empty_match) in enumerate(risk_tasks):
-                rsp, rup = build_risk_prompt({"requirement": req_text, "category": category, "requirement_id": req_id}, empty_match, open_requirement_threshold=0.5)
+            for i, (req_text, category, empty_match) in enumerate(risk_tasks):
+                rsp, rup = build_risk_prompt({"requirement": req_text, "category": category}, empty_match)
                 future = executor.submit(call_llm_with_stats, rsp + "\n\n" + rup)
-                futures[future] = (i, req_id, req_text, category, empty_match)
+                futures[future] = (i, req_text, category, empty_match)
             
             for future in as_completed(futures):
-                i, req_id, req_text, category, empty_match = futures[future]
+                i, req_text, category, empty_match = futures[future]
                 resp = future.result()
                 llm_stats["stages"]["risk"] += 1
                 risk_completed += 1
@@ -336,13 +388,13 @@ def main():
                     try:
                         r = json.loads(resp[resp.find('{'):resp.rfind('}')+1])
                         if r.get('matched_functions'):
-                            risk_tasks[i] = (req_id, req_text, category, r['matched_functions'][0])
+                            risk_tasks[i] = (req_text, category, r['matched_functions'][0])
                     except:
                         pass
         
         for i, (src_idx, req_idx) in enumerate(risk_req_indices):
-            if len(risk_tasks[i]) == 4 and isinstance(risk_tasks[i][3], dict):
-                results[src_idx]['requirements'][req_idx]['matched_functions'][0].update(risk_tasks[i][3])
+            if len(risk_tasks[i]) == 3 and isinstance(risk_tasks[i][2], dict):
+                results[src_idx]['requirements'][req_idx]['matched_functions'][0].update(risk_tasks[i][2])
     
     # 保存结果
     with open(OUT_PATH, 'w') as f:
@@ -381,7 +433,7 @@ def main():
                 ws.cell(row, 7, mf.get('founction_match_level', '')).border = thin_border
                 ws.cell(row, 8, mf.get('is_product_function_matched', '')).border = thin_border
                 ws.cell(row, 9, mf.get('delivery_type', '')).border = thin_border
-                ws.cell(row, 10, mf.get('requirement_clarity_score', '')).border = thin_border
+                ws.cell(row, 10, mf.get('reqirement_quality_level', '')).border = thin_border
                 # 格式化定制化工作说明（字典转字符串）
                 work_details = mf.get('customized_work_details', '')
                 if isinstance(work_details, dict):

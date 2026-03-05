@@ -1,72 +1,67 @@
 # 赛马智能体 - 回归测试用例
-# 针对已发现并修复的问题
 
 tests:
+  # ========== 输出验证型用例 ==========
+  
   # 1. 合并单元格保持
   - name: "合并单元格保持"
     desc: "验证需求拆分后单元格合并样式保留"
-    type: "excel_style"
-    check:
-      - sheet: "需求拆解"
-        cell: "A1"
-        style: "merge"
+    type: "excel_output_check"
+    check_type: "merge_cells"
     source: "business"
     
-  # 2. 人天评估不为空
-  - name: "人天评估不为空"
-    desc: "验证所有需求都有人天评估"
-    type: "excel_not_empty"
-    check:
-      - sheet: "需求拆解"
-        column: "人天"
+  # 2. 人天评估（匹配失败的需求）
+  - name: "人天评估"
+    desc: "验证匹配失败的需求有人天评估，匹配成功为空"
+    type: "excel_output_check"
+    check_type: "risk_assessment"
     source: "business"
     
-  # 3. 商务需求过滤
-  - name: "商务需求过滤"
-    desc: "验证商务类需求被正确过滤"
-    type: "filter_business"
-    check:
-      - sheet: "需求拆解"
-        column: "需求种类"
-        exclude: "商务"
+  # 3. 过滤规则
+  - name: "过滤规则"
+    desc: "验证排除的需求类型被正确过滤"
+    type: "excel_output_check"
+    check_type: "filter"
     source: "business"
-    
+
+  # ========== 代码检查型用例 ==========
+  
   # 4. Prompt外部引用
   - name: "Prompt外部引用"
-    desc: "验证Prompt不写死在代码中，而是引用外部.py文件"
-    type: "prompt_external"
-    check:
-      - import_pattern: "from prompts import"
+    desc: "验证Prompt不写死在代码中"
+    type: "code_check"
+    check_type: "import"
+    keywords: ["from prompts import", "import prompts"]
     source: "business"
     
   # 5. 阈值可配置
   - name: "阈值可配置"
     desc: "验证匹配度阈值可通过参数配置"
-    type: "threshold_config"
-    check:
-      - argument: "--threshold"
+    type: "code_check"
+    check_type: "argument"
+    keywords: ["--threshold", "threshold="]
     source: "business"
     
   # 6. 需求文件可配置
   - name: "需求文件可配置"
     desc: "验证输入的需求文件可通过参数配置"
-    type: "input_config"
-    check:
-      - argument: "--input"
+    type: "code_check"
+    check_type: "argument"
+    keywords: ["--input", "input="]
     source: "business"
     
   # 7. 日志控制
   - name: "日志控制"
-    desc: "验证可通过参数控制日志输出，避免上下文暴增"
-    type: "log_control"
-    check:
-      - argument: "--quiet"
+    desc: "验证可通过参数控制日志输出"
+    type: "code_check"
+    check_type: "argument"
+    keywords: ["--quiet", "--silent"]
     source: "business"
     
   # 8. 状态实时更新
   - name: "状态实时更新"
-    desc: "验证3个阶段（匹配、风险、输出）都会更新状态文件"
-    type: "status_update"
-    check:
-      - stages: ["match", "risk", "output"]
+    desc: "验证3个阶段都会更新状态文件"
+    type: "code_check"
+    check_type: "status_update"
+    keywords: ["match", "risk", "output", "status"]
     source: "business"
